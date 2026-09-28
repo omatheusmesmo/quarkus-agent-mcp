@@ -6,7 +6,6 @@ import dev.langchain4j.data.embedding.Embedding;
 import dev.langchain4j.data.segment.TextSegment;
 import dev.langchain4j.store.embedding.EmbeddingMatch;
 import dev.langchain4j.store.embedding.EmbeddingSearchRequest;
-import dev.langchain4j.store.embedding.EmbeddingSearchResult;
 import dev.langchain4j.store.embedding.filter.Filter;
 import dev.langchain4j.store.embedding.filter.comparison.ContainsString;
 import dev.langchain4j.store.embedding.pgvector.PgVectorEmbeddingStore;
@@ -142,8 +141,12 @@ public class DocSearchTools {
             }
 
             if (embeddingClient.isFailed()) {
-                return ToolResponse.error(
-                        "Documentation search is unavailable: " + embeddingClient.getFailureMessage());
+                String failure = embeddingClient.getFailureMessage();
+                if (containerManager.retryWarmUpIfFailed()) {
+                    return ToolResponse.success("Documentation search failed to start (" + failure
+                            + "). Retrying now; please try again in a few seconds.");
+                }
+                return ToolResponse.error("Documentation search is unavailable: " + failure);
             }
             if (!embeddingClient.isReady()) {
                 return ToolResponse.success(
@@ -157,37 +160,31 @@ public class DocSearchTools {
                     LOG.infof("Using Quarkus %s docs for project at %s", quarkusVersion, projectDir);
                 }
             }
-            PgVectorEmbeddingStore store = ensureInitialized(quarkusVersion, projectDir);
+            List<EmbeddingMatch<TextSegment>> rawMatches;
+            try {
+                rawMatches = findMatches(query, extension, quarkusVersion, projectDir);
+            } catch (RuntimeException e) {
+                // The shared container may have been restarted on new ports, or replaced, by another
+                // MCP server or the user: resolve it afresh and try once more. Other failures (timeouts,
+                // a failed image pull) would only take as long again, so they are not retried.
+                if (!isConnectionFailure(e)) {
+                    throw e;
+                }
+                LOG.warnf("Doc search could not reach the doc database (%s) — reconnecting and retrying",
+                        e.getMessage());
+                reconnect(quarkusVersion);
+                rawMatches = findMatches(query, extension, quarkusVersion, projectDir);
+            }
+
+            containerManager.markUsed(quarkusVersion);
+            containerManager.markUsed(null);
 
             // Check for newly added extensions (rate-limited)
             if (projectDir != null && !projectDir.isBlank()) {
                 maybeLoadIncrementalRagData(quarkusVersion, projectDir);
             }
 
-            Embedding queryEmbedding = new Embedding(embeddingClient.embed(query));
-
-            String effectiveExtension = extension;
-            if ((effectiveExtension == null || effectiveExtension.isBlank())) {
-                effectiveExtension = inferExtension(query);
-                if (effectiveExtension != null) {
-                    LOG.debugf("Auto-inferred extension filter: %s", effectiveExtension);
-                }
-            }
-
-            Filter sourceFilter = null;
-            if (effectiveExtension != null && !effectiveExtension.isBlank()) {
-                sourceFilter = new ContainsString("extension", effectiveExtension.trim());
-            }
-
-            EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
-                    .queryEmbedding(queryEmbedding)
-                    .filter(sourceFilter)
-                    .maxResults(SEARCH_CANDIDATES)
-                    .minScore(minScore)
-                    .build();
-
-            EmbeddingSearchResult<TextSegment> result = store.search(searchRequest);
-            List<EmbeddingMatch<TextSegment>> matches = result.matches().stream()
+            List<EmbeddingMatch<TextSegment>> matches = rawMatches.stream()
                     .filter(m -> m.embedded() != null && !isJunkChunk(m.embedded()))
                     .toList();
 
@@ -235,6 +232,62 @@ public class DocSearchTools {
             LOG.error("Doc search failed", e);
             return ToolResponse.error("Doc search failed: " + e.getMessage());
         }
+    }
+
+    private List<EmbeddingMatch<TextSegment>> findMatches(String query, String extension, String quarkusVersion,
+            String projectDir) {
+        PgVectorEmbeddingStore store = ensureInitialized(quarkusVersion, projectDir);
+        // The embedding server runs in the default container, which reconnect() may have dropped
+        containerManager.ensureRunning(null, null);
+
+        Embedding queryEmbedding = new Embedding(embeddingClient.embed(query));
+
+        String effectiveExtension = extension;
+        if ((effectiveExtension == null || effectiveExtension.isBlank())) {
+            effectiveExtension = inferExtension(query);
+            if (effectiveExtension != null) {
+                LOG.debugf("Auto-inferred extension filter: %s", effectiveExtension);
+            }
+        }
+
+        Filter sourceFilter = null;
+        if (effectiveExtension != null && !effectiveExtension.isBlank()) {
+            sourceFilter = new ContainsString("extension", effectiveExtension.trim());
+        }
+
+        EmbeddingSearchRequest searchRequest = EmbeddingSearchRequest.builder()
+                .queryEmbedding(queryEmbedding)
+                .filter(sourceFilter)
+                .maxResults(SEARCH_CANDIDATES)
+                .minScore(minScore)
+                .build();
+
+        return store.search(searchRequest).matches();
+    }
+
+    /** True if the failure means a doc container could not be reached at the address this server cached. */
+    static boolean isConnectionFailure(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof java.net.ConnectException || t instanceof java.net.NoRouteToHostException) {
+                return true;
+            }
+            // SQLState class 08: connection exception (refused, broken, cannot be established)
+            if (t instanceof java.sql.SQLException sql && sql.getSQLState() != null
+                    && sql.getSQLState().startsWith("08")) {
+                return true;
+            }
+            if (t.getCause() == t) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    /** Drops every cached connection to the doc containers so the next search resolves them again. */
+    private void reconnect(String quarkusVersion) {
+        embeddingStores.remove(quarkusVersion != null ? quarkusVersion : DEFAULT_VERSION_KEY);
+        containerManager.invalidate(quarkusVersion);
+        containerManager.invalidate(null);
     }
 
     private PgVectorEmbeddingStore ensureInitialized(String quarkusVersion, String projectDir) {
@@ -290,11 +343,15 @@ public class DocSearchTools {
         }
         lastIncrementalCheck.put(key, now);
 
-        try {
-            containerManager.loadIncrementalRagData(quarkusVersion, projectDir);
-        } catch (Exception e) {
-            LOG.debugf("Incremental RAG check failed: %s", e.getMessage());
-        }
+        // In the background: it can wait minutes on the load lock while another MCP server sharing
+        // the container is loading, and the search it piggybacks on already has its results
+        Thread.ofVirtual().name("rag-incremental-check").start(() -> {
+            try {
+                containerManager.loadIncrementalRagData(quarkusVersion, projectDir);
+            } catch (Exception e) {
+                LOG.debugf("Incremental RAG check failed: %s", e.getMessage());
+            }
+        });
     }
 
     private boolean isJunkChunk(TextSegment segment) {
