@@ -157,4 +157,64 @@ class RagSqlLoaderReloadTest {
         assertEquals(RagSqlLoader.fingerprint("3.21.0", sql),
                 new RagSqlLoader().queryLoadedFingerprints(jdbcUrl, user, password).get("quarkus-rest"));
     }
+
+    @Test
+    void aReplacedDatabaseIsReloadedByTheSameLoader() throws SQLException {
+        RagSqlLoader loader = new RagSqlLoader();
+        String sql = aggregatedSql("chunk one", "chunk two");
+        List<RagSqlLoader.RagFragment> fragments = List.of(new RagSqlLoader.RagFragment("quarkus-rest", sql));
+
+        loader.loadStaleFragments("3.21.0", "3.21.0", fragments, jdbcUrl, user, password);
+        assertEquals(2, countDocuments());
+
+        // As if the container was removed and recreated empty while this server kept running
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
+                Statement stmt = conn.createStatement()) {
+            stmt.execute("TRUNCATE rag_documents, rag_sources");
+        }
+
+        loader.loadStaleFragments("3.21.0", "3.21.0", fragments, jdbcUrl, user, password);
+        assertEquals(2, countDocuments(), "The loader must go by what the database holds, not by what it loaded before");
+    }
+
+    @Test
+    void aHeldLoadLockFailsTheLoadInsteadOfRunningItUnlocked() throws SQLException {
+        RagSqlLoader loader = new RagSqlLoader();
+        loader.loadLockTimeout = java.time.Duration.ofSeconds(1);
+        try (Connection holder = DriverManager.getConnection(jdbcUrl, user, password);
+                Statement stmt = holder.createStatement()) {
+            // Another server holding the lock mid-load
+            stmt.execute("SELECT pg_advisory_lock(" + 0x71_6167_6e74_4d43L + ")");
+
+            var ran = new java.util.concurrent.atomic.AtomicBoolean();
+            var failure = org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class,
+                    () -> loader.withLoadLock(jdbcUrl, user, password, () -> ran.set(true)));
+
+            assertTrue(failure.getMessage().contains("try again later"), failure.getMessage());
+            org.junit.jupiter.api.Assertions.assertFalse(ran.get(), "Loading unlocked would bring the deadlock back");
+        }
+
+        // Released when the holder's connection closed
+        var ran = new java.util.concurrent.atomic.AtomicBoolean();
+        loader.withLoadLock(jdbcUrl, user, password, () -> ran.set(true));
+        assertTrue(ran.get());
+    }
+
+    @Test
+    void serversWantingDifferentContentDoNotKeepOverwritingEachOther() throws SQLException {
+        RagSqlLoader serverA = new RagSqlLoader();
+        RagSqlLoader serverB = new RagSqlLoader();
+        String contentA = aggregatedSql("extension docs, version A");
+        String contentB = aggregatedSql("extension docs, version B");
+        var fragmentsA = List.of(new RagSqlLoader.RagFragment("quarkus-rest", contentA));
+        var fragmentsB = List.of(new RagSqlLoader.RagFragment("quarkus-rest", contentB));
+
+        serverA.loadStaleFragments("3.21.0", "3.21.0", fragmentsA, jdbcUrl, user, password);
+        serverB.loadStaleFragments("3.21.0", "3.21.0", fragmentsB, jdbcUrl, user, password);
+        // A's next incremental check must leave B's content alone rather than reload its own
+        serverA.loadStaleFragments("3.21.0", "3.21.0", fragmentsA, jdbcUrl, user, password);
+
+        assertEquals(RagSqlLoader.fingerprint("3.21.0", contentB),
+                new RagSqlLoader().queryLoadedFingerprints(jdbcUrl, user, password).get("quarkus-rest"));
+    }
 }

@@ -345,4 +345,13 @@ class RagSqlLoaderTest {
         assertFalse(result.sql().contains("\"extension_version\""),
                 "extension_version should not be added when quarkusVersion is null");
     }
+
+    @Test
+    void needsLoadingLoadsMissingAndChangedContentButDoesNotFightAnotherServer() {
+        assertTrue(RagSqlLoader.needsLoading("new", null, null), "missing source");
+        assertTrue(RagSqlLoader.needsLoading("new", null, "new"), "missing again, e.g. a replaced container");
+        assertTrue(RagSqlLoader.needsLoading("new", "old", null), "changed upstream");
+        assertFalse(RagSqlLoader.needsLoading("same", "same", null), "already there");
+        assertFalse(RagSqlLoader.needsLoading("mine", "theirs", "mine"), "another server's content since");
+    }
 }

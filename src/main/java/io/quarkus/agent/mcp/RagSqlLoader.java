@@ -58,6 +58,16 @@ public class RagSqlLoader {
 
     private static final Logger LOG = Logger.getLogger(RagSqlLoader.class);
 
+    /**
+     * Database system identifier -&gt; (source -&gt; fingerprint this server loaded into it). The
+     * database's own {@code rag_sources} table is what decides whether something is loaded; this
+     * only stops servers sharing a container from repeatedly overwriting each other's content.
+     */
+    private final Map<String, Map<String, String>> loadedHere = new ConcurrentHashMap<>();
+
+    /** How long to wait for another server's load before giving up; below the 5-minute warm-up watchdog. */
+    Duration loadLockTimeout = Duration.ofMinutes(4);
+
     @Inject
     WebClient webClient;
 
@@ -79,6 +89,8 @@ public class RagSqlLoader {
     private static final String CORE_GROUP_ID = "io.quarkus";
     private static final String RAG_DOCUMENTS_TABLE = "rag_documents";
     private static final String RAG_SOURCES_TABLE = "rag_sources";
+    /** Advisory lock key serializing RAG loads across MCP servers sharing a container. */
+    private static final long LOAD_LOCK_KEY = 0x71_6167_6e74_4d43L;
 
     private static final String CREATE_EXTENSION_DDL = "CREATE EXTENSION IF NOT EXISTS vector";
     private static final String CREATE_TABLE_DDL = """
@@ -142,15 +154,15 @@ public class RagSqlLoader {
         return entry != null ? entry : jar.getJarEntry(RAG_SQL_PATH);
     }
 
-    /** versionKey -&gt; (source -&gt; fingerprint of the fragment currently loaded for it). */
-    private final Map<String, Map<String, String>> loadedFingerprints = new ConcurrentHashMap<>();
-
     /**
      * Ensures RAG data is loaded for the given Quarkus version.
      * Discovers SQL fragments from core and non-core extension JARs, and loads
      * those that are new or whose content has changed since they were last loaded.
-     * On first call for a version with a reused container, seeds tracking
-     * from the database to avoid redundant loading.
+     * <p>
+     * What is loaded is always read from the database's {@code rag_sources} table, never kept in
+     * memory: the container can be shared with other MCP servers or replaced underneath this one,
+     * and only the database knows what it actually holds. Schema creation and loading run under
+     * one advisory lock, so servers sharing a container take turns instead of deadlocking.
      */
     public void ensureLoaded(String quarkusVersion, String projectDir,
             String host, int port, String database, String user, String password) {
@@ -158,35 +170,41 @@ public class RagSqlLoader {
         String jdbcUrl = "jdbc:postgresql://" + host + ":" + port + "/" + database;
         LOG.infof("RAG ensureLoaded: starting for version=%s, projectDir=%s", versionKey, projectDir);
 
-        ensureSchema(jdbcUrl, user, password);
-
+        // Discovery reads jars and may resolve Maven artifacts, so it runs before taking the lock
         String resolvedVersion = quarkusVersion != null ? quarkusVersion : detectLatestInstalledVersion();
+        List<RagFragment> allFragments = List.of();
         if (resolvedVersion == null) {
             LOG.warn("Could not determine Quarkus version for RAG loading — no SQL fragments will be loaded");
-            return;
+        } else {
+            long discoverStart = System.currentTimeMillis();
+            allFragments = discoverSqlFragments(resolvedVersion, projectDir);
+            LOG.infof("RAG ensureLoaded: discovered %d fragment(s) for %s in %d ms", allFragments.size(),
+                    resolvedVersion, System.currentTimeMillis() - discoverStart);
+            if (allFragments.isEmpty()) {
+                LOG.infof("No RAG SQL fragments found for Quarkus %s", resolvedVersion);
+            }
         }
 
-        long discoverStart = System.currentTimeMillis();
-        List<RagFragment> allFragments = discoverSqlFragments(resolvedVersion, projectDir);
-        LOG.infof("RAG ensureLoaded: discovered %d fragment(s) for %s in %d ms", allFragments.size(),
-                resolvedVersion, System.currentTimeMillis() - discoverStart);
-        if (allFragments.isEmpty()) {
-            LOG.infof("No RAG SQL fragments found for Quarkus %s", resolvedVersion);
-            return;
-        }
+        List<RagFragment> fragments = allFragments;
+        withLoadLock(jdbcUrl, user, password, () -> {
+            ensureSchema(jdbcUrl, user, password);
+            if (!fragments.isEmpty()) {
+                loadStaleFragments(versionKey, resolvedVersion, fragments, jdbcUrl, user, password);
+            }
+        });
+    }
 
-        Map<String, String> loaded = loadedFingerprints.computeIfAbsent(versionKey,
+    void loadStaleFragments(String versionKey, String resolvedVersion, List<RagFragment> allFragments,
+            String jdbcUrl, String user, String password) {
+        Map<String, String> inDatabase = queryLoadedFingerprints(jdbcUrl, user, password);
+        Map<String, String> loadedByUs = loadedHere.computeIfAbsent(databaseId(jdbcUrl, user, password),
                 k -> new ConcurrentHashMap<>());
-
-        // On first call for this version, seed from the database (handles container reuse)
-        if (loaded.isEmpty()) {
-            loaded.putAll(queryLoadedFingerprints(jdbcUrl, user, password));
-        }
 
         List<StaleFragment> staleFragments = new ArrayList<>();
         for (RagFragment fragment : allFragments) {
             String fingerprint = fingerprint(resolvedVersion, fragment);
-            if (fingerprint != null && !fingerprint.equals(loaded.get(fragment.source()))) {
+            if (fingerprint != null && needsLoading(fingerprint, inDatabase.get(fragment.source()),
+                    loadedByUs.get(fragment.source()))) {
                 staleFragments.add(new StaleFragment(fragment, fingerprint));
             }
         }
@@ -199,9 +217,42 @@ public class RagSqlLoader {
 
         if (loadSql(jdbcUrl, user, password, staleFragments, resolvedVersion)) {
             for (StaleFragment stale : staleFragments) {
-                loaded.put(stale.fragment().source(), stale.fingerprint());
+                loadedByUs.put(stale.fragment().source(), stale.fingerprint());
             }
         }
+    }
+
+    /**
+     * Whether to load a fragment, given what the database holds for its source and what this
+     * server last loaded into this same database. Missing sources are always loaded, as is content
+     * that differs from what is there. The exception: servers sharing a container can want
+     * different content for the same source (different versions of an extension in their
+     * projects), and once this server has loaded its content it does not overwrite another
+     * server's again, or the two would keep replacing each other's rows.
+     */
+    static boolean needsLoading(String wanted, String inDatabase, String loadedByUs) {
+        if (inDatabase == null) {
+            return true;
+        }
+        return !wanted.equals(inDatabase) && !wanted.equals(loadedByUs);
+    }
+
+    /**
+     * Identifies the database itself rather than its address: Postgres's system identifier is
+     * generated when the data directory is created, so a replaced container gets a new one even if
+     * it ends up on the same host port. Falls back to the address if it cannot be read.
+     */
+    private static String databaseId(String jdbcUrl, String user, String password) {
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password);
+                Statement stmt = conn.createStatement();
+                ResultSet rs = stmt.executeQuery("SELECT system_identifier FROM pg_control_system()")) {
+            if (rs.next()) {
+                return rs.getString(1);
+            }
+        } catch (SQLException e) {
+            LOG.debugf("Could not read the database's system identifier: %s", e.getMessage());
+        }
+        return jdbcUrl;
     }
 
     /** A fragment that needs (re)loading, and the fingerprint to record once it is loaded. */
@@ -1009,6 +1060,45 @@ public class RagSqlLoader {
         String remaining = current.toString().trim();
         if (!remaining.isEmpty()) {
             sink.accept(remaining);
+        }
+    }
+
+    /**
+     * Runs {@code action} while holding a Postgres advisory lock. Several MCP servers can share
+     * one doc-search container, and two of them loading fragments at the same time deadlock
+     * over the same rows; under the lock the second one waits, then finds the first one's
+     * fingerprints and has nothing left to load. The lock is session-scoped, so it is released
+     * when the connection closes, even if the server holding it dies mid-load.
+     * <p>
+     * The lock is polled rather than awaited in {@code pg_advisory_lock}, so a server stuck
+     * mid-load cannot hang the others forever. Giving up fails the load instead of running it
+     * unlocked, which would bring the deadlock back; the caller retries later.
+     *
+     * @throws IllegalStateException if the lock cannot be taken within {@link #loadLockTimeout}
+     */
+    void withLoadLock(String jdbcUrl, String user, String password, Runnable action) {
+        try (Connection lockConn = DriverManager.getConnection(jdbcUrl, user, password);
+                Statement stmt = lockConn.createStatement()) {
+            long deadline = System.nanoTime() + loadLockTimeout.toNanos();
+            while (!tryLock(stmt)) {
+                if (System.nanoTime() > deadline) {
+                    throw new IllegalStateException("Another MCP server has been loading documentation into this "
+                            + "container for over " + loadLockTimeout.toMinutes() + " minutes; try again later");
+                }
+                Thread.sleep(500);
+            }
+            action.run();
+        } catch (SQLException e) {
+            throw new IllegalStateException("Could not reach the documentation database: " + e.getMessage(), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for the RAG load lock", e);
+        }
+    }
+
+    private static boolean tryLock(Statement stmt) throws SQLException {
+        try (ResultSet rs = stmt.executeQuery("SELECT pg_try_advisory_lock(" + LOAD_LOCK_KEY + ")")) {
+            return rs.next() && rs.getBoolean(1);
         }
     }
 
