@@ -33,12 +33,9 @@ public class EmbeddingClient {
     }
 
     public float[] embed(String text) {
-        String host = containerManager.getEmbeddingHost();
-        int port = containerManager.getEmbeddingPort();
-
         JsonObject body = new JsonObject().put("text", text);
 
-        var httpResponse = webClient.post(port, host, "/embed")
+        var httpResponse = webClient.postAbs(containerManager.getEmbeddingUrl() + "/embed")
                 .sendJsonObject(body)
                 .onFailure().retry().atMost(2)
                 .await().atMost(TIMEOUT);

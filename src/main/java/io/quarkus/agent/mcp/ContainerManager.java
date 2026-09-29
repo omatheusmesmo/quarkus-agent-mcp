@@ -30,10 +30,13 @@ import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.function.Function;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.testcontainers.DockerClientFactory;
@@ -60,6 +63,9 @@ import org.testcontainers.utility.DockerImageName;
  * MCP server or the user can restart, re-publish or remove the shared container at any time, so
  * callers that fail to reach it call {@link #invalidate} and {@link #ensureRunning} again, which
  * resolves the container afresh from Docker. Nothing here ever deletes a named container.
+ * <p>
+ * With {@code agent-mcp.doc-search.pg-host} set, an existing database and embedding server are
+ * used instead and no container runtime is needed, e.g. where the server runs in a sandbox.
  */
 @ApplicationScoped
 public class ContainerManager {
@@ -86,6 +92,21 @@ public class ContainerManager {
     @ConfigProperty(name = "agent-mcp.doc-search.pg-database", defaultValue = "quarkus")
     String pgDatabase;
 
+    /** Host of an existing doc-search database. When set, no container is started. */
+    @ConfigProperty(name = "agent-mcp.doc-search.pg-host")
+    Optional<String> externalHost = Optional.empty();
+
+    @ConfigProperty(name = "agent-mcp.doc-search.pg-port", defaultValue = "5432")
+    int externalPort = PG_PORT;
+
+    /** Embedding server for an existing database; defaults to its port on {@code pg-host}. */
+    @ConfigProperty(name = "agent-mcp.doc-search.embedding-url")
+    Optional<String> externalEmbeddingUrl = Optional.empty();
+
+    /** Never write to an existing database: its docs are loaded ahead of time by someone else. */
+    @ConfigProperty(name = "agent-mcp.doc-search.read-only", defaultValue = "false")
+    boolean readOnly;
+
     @Inject
     RagSqlLoader ragSqlLoader;
 
@@ -100,10 +121,13 @@ public class ContainerManager {
     @ConfigProperty(name = "agent-mcp.doc-search.idle-remove-after", defaultValue = "P14D")
     Duration idleRemoveAfter = Duration.ofDays(14);
 
+    /** How long to wait for a doc-search database and embedding server to accept requests. */
+    Duration startupTimeout = Duration.ofMinutes(3);
+
     static final String CONTAINER_NAME_PREFIX = "quarkus-agent-mcp-docs-";
+    private static final String EXTERNAL_ID = "external";
     private static final int PG_PORT = 5432;
     private static final int EMBEDDING_PORT = 9222;
-    private static final Duration STARTUP_TIMEOUT = Duration.ofMinutes(3);
     private static final Duration CLEANUP_INTERVAL = Duration.ofHours(6);
     private static final long MARK_USED_INTERVAL_MS = 5 * 60_000;
     private static final String USAGE_TABLE = "agent_mcp_usage";
@@ -201,7 +225,9 @@ public class ContainerManager {
                 ensureRunning(null, null);
                 recordWarmupSuccess();
                 LOG.infof("Documentation search is ready (%d ms)", System.currentTimeMillis() - warmupStart);
-                scheduleCleanup();
+                if (!isExternal()) {
+                    scheduleCleanup();
+                }
             } catch (Throwable e) {
                 // Catch Throwable, not just Exception: an uncaught Error (e.g. NoClassDefFoundError,
                 // ExceptionInInitializerError) would otherwise kill this thread silently without ever
@@ -294,15 +320,72 @@ public class ContainerManager {
         if (containers.containsKey(versionKey)) {
             return;
         }
-        checkDockerAvailable();
+        if (!isExternal()) {
+            checkDockerAvailable();
+        }
         // One lock per version: starting or loading one version's container can take minutes and
         // must not hold up searches or startups for other versions
         synchronized (versionLocks.computeIfAbsent(versionKey, k -> new Object())) {
             if (containers.containsKey(versionKey)) {
                 return;
             }
-            startAndLoad(versionKey, quarkusVersion, projectDir);
+            if (isExternal()) {
+                connectExternal(versionKey, quarkusVersion, projectDir);
+            } else {
+                startAndLoad(versionKey, quarkusVersion, projectDir);
+            }
         }
+    }
+
+    /**
+     * Ensures the embedding server is up. In a container setup it runs in the default container,
+     * which a reconnect may have dropped. An existing database's embedding server needs no setup,
+     * and resolving the default version there would load its docs over the ones a project's
+     * version loaded into the shared database.
+     */
+    public void ensureEmbeddingServer() {
+        if (!isExternal()) {
+            ensureRunning(null, null);
+        }
+    }
+
+    /** True if doc search uses an existing database rather than a container. */
+    boolean isExternal() {
+        return externalHost.isPresent();
+    }
+
+    /**
+     * Uses the database at {@code pg-host} for a version. Every version shares it, so it holds one
+     * set of docs; unless it is read-only, each version's docs are loaded into it as they would be
+     * into that version's container.
+     */
+    private void connectExternal(String versionKey, String quarkusVersion, String projectDir) {
+        String where = externalHost.get() + ":" + externalPort;
+        DocContainer database = new DocContainer(EXTERNAL_ID, externalHost.get(), externalPort, -1);
+        LOG.infof("Using doc-search database at %s and embedding server at %s for Quarkus %s",
+                where, embeddingUrl(), versionKey);
+        awaitReady("doc-search database at " + where, database, embeddingUrl(), () -> false,
+                detail -> new IllegalStateException("Doc-search database at " + where + " or embedding server at "
+                        + embeddingUrl() + " is not reachable: " + detail));
+        containers.put(versionKey, database);
+        if (readOnly) {
+            return;
+        }
+        try {
+            if (supportsRagSql(quarkusVersion)) {
+                loadRagData(versionKey, quarkusVersion, projectDir);
+            } else {
+                loadNonCoreRagData(versionKey, quarkusVersion, projectDir);
+            }
+        } catch (RuntimeException | Error e) {
+            containers.remove(versionKey);
+            throw e;
+        }
+    }
+
+    private String embeddingUrl() {
+        String url = externalEmbeddingUrl.orElseGet(() -> "http://" + externalHost.get() + ":" + EMBEDDING_PORT);
+        return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
     }
 
     private void startAndLoad(String versionKey, String quarkusVersion, String projectDir) {
@@ -356,6 +439,9 @@ public class ContainerManager {
      * For legacy containers, only non-core extension docs are loaded (core docs are baked in).
      */
     public void loadIncrementalRagData(String quarkusVersion, String projectDir) {
+        if (isExternal() && readOnly) {
+            return;
+        }
         String versionKey = quarkusVersion != null ? quarkusVersion : "default";
         DocContainer container = containers.get(versionKey);
         if (container == null) {
@@ -383,12 +469,13 @@ public class ContainerManager {
         return getContainer(quarkusVersion).host();
     }
 
-    public String getEmbeddingHost() {
-        return getContainer(null).host();
-    }
-
-    public int getEmbeddingPort() {
-        return getContainer(null).embeddingPort();
+    /** The embedding server's base URL, without a trailing slash. */
+    public String getEmbeddingUrl() {
+        if (isExternal()) {
+            return embeddingUrl();
+        }
+        DocContainer container = getContainer(null);
+        return "http://" + container.host() + ":" + container.embeddingPort();
     }
 
     /**
@@ -396,6 +483,11 @@ public class ContainerManager {
      * discovery (DOCKER_HOST, Podman sockets, Docker Desktop, ...) works as before.
      * {@link DockerClientFactory#client()} is avoided because it also starts a Ryuk reaper.
      */
+    /** True once this server has created a Docker client, i.e. has tried to talk to Docker. */
+    boolean dockerClientCreated() {
+        return dockerClient != null;
+    }
+
     private DockerClient docker() {
         DockerClient client = dockerClient;
         if (client == null) {
@@ -417,6 +509,10 @@ public class ContainerManager {
      * Rate-limited per container and done off the caller's thread.
      */
     public void markUsed(String quarkusVersion) {
+        if (isExternal()) {
+            // Only container cleanup reads the record, and an existing database may be read-only
+            return;
+        }
         DocContainer container = containers.get(quarkusVersion != null ? quarkusVersion : "default");
         if (container == null) {
             return;
@@ -643,7 +739,8 @@ public class ContainerManager {
             throw new RuntimeException(
                     "Documentation search requires Docker or Podman, but neither is available. "
                             + "Install Docker (https://docs.docker.com/get-docker/) or Podman, "
-                            + "then try again. All other Quarkus tools work without Docker.");
+                            + "then try again, or point agent-mcp.doc-search.pg-host at an existing doc-search "
+                            + "database. All other Quarkus tools work without Docker.");
         }
     }
 
@@ -886,15 +983,27 @@ public class ContainerManager {
                         "Container " + info.getName() + " has no host port for " + containerPort));
     }
 
-    /**
-     * Polls until PostgreSQL accepts TCP connections and, if present, the embedding server's
-     * health check passes. The postgres entrypoint runs its init phase with TCP disabled, so a
-     * successful connection means the final server is up.
-     */
     private void waitUntilReady(DocContainer container, String name) {
+        String embedding = container.embeddingPort() < 0 ? null
+                : "http://" + container.host() + ":" + container.embeddingPort();
+        awaitReady(name, container, embedding, () -> hasStopped(container),
+                detail -> startupFailure(name, detail, null));
+    }
+
+    /**
+     * Polls until PostgreSQL accepts TCP connections and, if given, the embedding server's health
+     * check passes. The postgres entrypoint runs its init phase with TCP disabled, so a successful
+     * connection means the final server is up.
+     *
+     * @param embeddingUrl the embedding server's base URL, or null if there is none
+     * @param stopped      true once waiting is pointless because the database is gone
+     * @param failure      builds the exception to throw from a description of what went wrong
+     */
+    private void awaitReady(String name, DocContainer container, String embeddingUrl, BooleanSupplier stopped,
+            Function<String, RuntimeException> failure) {
         String jdbcUrl = "jdbc:postgresql://" + container.host() + ":" + container.pgPort() + "/" + pgDatabase;
         HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
-        long deadline = System.nanoTime() + STARTUP_TIMEOUT.toNanos();
+        long deadline = System.nanoTime() + startupTimeout.toNanos();
         String lastError = null;
         while (true) {
             try {
@@ -905,12 +1014,11 @@ public class ContainerManager {
                 try (Connection ignored = DriverManager.getConnection(jdbcUrl, props)) {
                     // connected
                 }
-                if (container.embeddingPort() < 0) {
+                if (embeddingUrl == null) {
                     return;
                 }
                 HttpResponse<Void> response = http.send(
-                        HttpRequest.newBuilder(URI.create(
-                                "http://" + container.host() + ":" + container.embeddingPort() + "/health"))
+                        HttpRequest.newBuilder(URI.create(embeddingUrl + "/health"))
                                 .timeout(Duration.ofSeconds(5)).build(),
                         HttpResponse.BodyHandlers.discarding());
                 if (response.statusCode() == 200) {
@@ -923,12 +1031,11 @@ public class ContainerManager {
             } catch (Exception e) {
                 lastError = e.getMessage();
             }
-            if (hasStopped(container)) {
-                throw startupFailure(name, "it stopped during startup", null);
+            if (stopped.getAsBoolean()) {
+                throw failure.apply("it stopped during startup");
             }
             if (System.nanoTime() > deadline) {
-                throw startupFailure(name, "not ready within " + STARTUP_TIMEOUT.toMinutes() + " minutes ("
-                        + lastError + ")", null);
+                throw failure.apply("not ready within " + startupTimeout.toSeconds() + " s (" + lastError + ")");
             }
             try {
                 Thread.sleep(500);

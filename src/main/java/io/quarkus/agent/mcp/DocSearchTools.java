@@ -237,8 +237,7 @@ public class DocSearchTools {
     private List<EmbeddingMatch<TextSegment>> findMatches(String query, String extension, String quarkusVersion,
             String projectDir) {
         PgVectorEmbeddingStore store = ensureInitialized(quarkusVersion, projectDir);
-        // The embedding server runs in the default container, which reconnect() may have dropped
-        containerManager.ensureRunning(null, null);
+        containerManager.ensureEmbeddingServer();
 
         Embedding queryEmbedding = new Embedding(embeddingClient.embed(query));
 
