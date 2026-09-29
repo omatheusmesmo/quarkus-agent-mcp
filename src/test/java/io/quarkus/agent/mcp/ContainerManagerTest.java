@@ -220,8 +220,19 @@ class ContainerManagerTest {
 
         assertTrue(e.getMessage().contains("localhost:" + unusedPort + " or embedding server at http://localhost:9222 is not reachable"),
                 e.getMessage());
-        assertFalse(e.getMessage().contains("Docker"), e.getMessage());
+        assertFalse(manager.dockerClientCreated(), "Docker must not be contacted");
         assertTrue(manager.containers.isEmpty(), "A database that was never reached must not be cached");
+    }
+
+    @Test
+    void embeddingServerOfAnExistingDatabaseNeedsNoDefaultVersion() {
+        // Unreachable, so resolving the default version here would fail instead of returning
+        ContainerManager manager = externalManager("localhost", 1);
+
+        manager.ensureEmbeddingServer();
+
+        assertTrue(manager.containers.isEmpty(), "The default version must not be loaded into the shared database");
+        assertFalse(manager.dockerClientCreated());
     }
 
     static ContainerManager externalManager(String host, int port) {

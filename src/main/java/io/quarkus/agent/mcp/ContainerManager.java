@@ -337,6 +337,18 @@ public class ContainerManager {
         }
     }
 
+    /**
+     * Ensures the embedding server is up. In a container setup it runs in the default container,
+     * which a reconnect may have dropped. An existing database's embedding server needs no setup,
+     * and resolving the default version there would load its docs over the ones a project's
+     * version loaded into the shared database.
+     */
+    public void ensureEmbeddingServer() {
+        if (!isExternal()) {
+            ensureRunning(null, null);
+        }
+    }
+
     /** True if doc search uses an existing database rather than a container. */
     boolean isExternal() {
         return externalHost.isPresent();
@@ -471,6 +483,11 @@ public class ContainerManager {
      * discovery (DOCKER_HOST, Podman sockets, Docker Desktop, ...) works as before.
      * {@link DockerClientFactory#client()} is avoided because it also starts a Ryuk reaper.
      */
+    /** True once this server has created a Docker client, i.e. has tried to talk to Docker. */
+    boolean dockerClientCreated() {
+        return dockerClient != null;
+    }
+
     private DockerClient docker() {
         DockerClient client = dockerClient;
         if (client == null) {

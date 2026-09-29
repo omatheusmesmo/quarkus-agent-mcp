@@ -287,6 +287,7 @@ class ContainerManagerDockerTest {
             assertEquals(0, docker.listContainersCmd().withShowAll(true)
                     .withLabelFilter(java.util.Map.of("quarkus-agent-mcp.version", otherVersion))
                     .exec().size(), "No container may be started for an existing database");
+            assertFalse(manager.dockerClientCreated(), "Docker must not be contacted for an existing database");
 
             // Reconnecting after a failed search resolves the same database again
             manager.invalidate(otherVersion);
