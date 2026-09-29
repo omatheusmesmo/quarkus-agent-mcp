@@ -188,4 +188,49 @@ class ContainerManagerTest {
             stuck.join();
         }
     }
+
+    // ── existing database (agent-mcp.doc-search.pg-host) ────────────────────────
+
+    @Test
+    void embeddingUrlDefaultsToTheDatabaseHost() {
+        ContainerManager manager = externalManager("docs-db", 5432);
+
+        assertTrue(manager.isExternal());
+        assertEquals("http://docs-db:9222", manager.getEmbeddingUrl());
+    }
+
+    @Test
+    void embeddingUrlCanBeSetAndLosesItsTrailingSlash() {
+        ContainerManager manager = externalManager("docs-db", 5432);
+        manager.externalEmbeddingUrl = java.util.Optional.of("https://embed.example.com/v1/");
+
+        assertEquals("https://embed.example.com/v1", manager.getEmbeddingUrl());
+    }
+
+    @Test
+    void unreachableDatabaseFailsWithoutNeedingDocker() throws Exception {
+        int unusedPort;
+        try (var socket = new java.net.ServerSocket(0)) {
+            unusedPort = socket.getLocalPort();
+        }
+        ContainerManager manager = externalManager("localhost", unusedPort);
+        manager.startupTimeout = java.time.Duration.ofSeconds(1);
+
+        var e = assertThrows(IllegalStateException.class, () -> manager.ensureRunning(null, null));
+
+        assertTrue(e.getMessage().contains("localhost:" + unusedPort + " or embedding server at http://localhost:9222 is not reachable"),
+                e.getMessage());
+        assertFalse(e.getMessage().contains("Docker"), e.getMessage());
+        assertTrue(manager.containers.isEmpty(), "A database that was never reached must not be cached");
+    }
+
+    static ContainerManager externalManager(String host, int port) {
+        ContainerManager manager = new ContainerManager();
+        manager.pgUser = "quarkus";
+        manager.pgPassword = "quarkus";
+        manager.pgDatabase = "quarkus";
+        manager.externalHost = java.util.Optional.of(host);
+        manager.externalPort = port;
+        return manager;
+    }
 }

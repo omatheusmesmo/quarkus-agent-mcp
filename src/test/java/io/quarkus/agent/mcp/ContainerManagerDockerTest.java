@@ -260,4 +260,43 @@ class ContainerManagerDockerTest {
             manager.releaseContainerReferences();
         }
     }
+
+    @Test
+    void existingDatabaseIsUsedWithoutStartingAContainer() throws Exception {
+        // Someone else's doc-search database, and an embedding server that only answers health checks
+        ContainerManager owner = newManager();
+        var database = owner.startOrAttach(versionKey, IMAGE, false);
+        var embedding = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("localhost", 0), 0);
+        embedding.createContext("/health", exchange -> {
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+        embedding.start();
+        String embeddingUrl = "http://localhost:" + embedding.getAddress().getPort();
+
+        ContainerManager manager = ContainerManagerTest.externalManager(database.host(), database.pgPort());
+        manager.externalEmbeddingUrl = java.util.Optional.of(embeddingUrl + "/");
+        manager.readOnly = true;
+        String otherVersion = versionKey + "-external";
+        try {
+            manager.ensureRunning(otherVersion, null);
+
+            assertEquals(database.host(), manager.getHost(otherVersion));
+            assertEquals(database.pgPort(), manager.getMappedPort(otherVersion));
+            assertEquals(embeddingUrl, manager.getEmbeddingUrl());
+            assertEquals(0, docker.listContainersCmd().withShowAll(true)
+                    .withLabelFilter(java.util.Map.of("quarkus-agent-mcp.version", otherVersion))
+                    .exec().size(), "No container may be started for an existing database");
+
+            // Reconnecting after a failed search resolves the same database again
+            manager.invalidate(otherVersion);
+            manager.ensureRunning(otherVersion, null);
+            assertEquals(database.pgPort(), manager.getMappedPort(otherVersion));
+        } finally {
+            embedding.stop(0);
+            manager.releaseContainerReferences();
+            owner.releaseContainerReferences();
+        }
+    }
 }
+

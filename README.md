@@ -334,6 +334,18 @@ To narrow results to a specific extension, use the `extension` parameter:
 quarkus_searchDocs query="broadcasting messages" extension="quarkus-json-rpc"
 ```
 
+#### Without Docker or Podman
+
+Where no container runtime is available (or wanted), for example when the server runs in a sandbox, point it at a doc-search database that is already running instead. The simplest one is the image the server would otherwise start itself, run as a service that publishes PostgreSQL on 5432 and the embedding server on 9222:
+
+```bash
+docker run -d -p 5432:5432 -p 9222:9222 \
+  -e POSTGRES_USER=quarkus -e POSTGRES_PASSWORD=quarkus -e POSTGRES_DB=quarkus \
+  ghcr.io/quarkusio/quarkus-agent-pgvector:pg17
+```
+
+Then start the MCP server with `AGENT_MCP_DOC_SEARCH_PG_HOST=<host>` (and `AGENT_MCP_DOC_SEARCH_EMBEDDING_URL` if the embedding server is elsewhere). No container is started and Docker is never contacted. Every Quarkus version shares that one database, and docs are loaded into it as they would be into a container. If the database is loaded ahead of time and clients should only read it, also set `AGENT_MCP_DOC_SEARCH_READ_ONLY=true`.
+
 ## MCP Tools Reference
 
 ### App Creation
@@ -450,6 +462,11 @@ Configuration via `application.properties`, system properties (`-D`), or environ
 | `agent-mcp.doc-search.pg-password` | `quarkus` | PostgreSQL password |
 | `agent-mcp.doc-search.pg-database` | `quarkus` | PostgreSQL database |
 | `agent-mcp.doc-search.min-score` | `0.82` | Minimum similarity score for search results |
+| `agent-mcp.doc-search.pg-host` | _(none)_ | Host of an existing doc-search database. When set, no container is started and Docker/Podman is not needed |
+| `agent-mcp.doc-search.pg-port` | `5432` | Port of the existing doc-search database |
+| `agent-mcp.doc-search.embedding-url` | `http://<pg-host>:9222` | Embedding server for the existing database |
+| `agent-mcp.doc-search.read-only` | `false` | With `pg-host`: never write to the database (no docs loading); for databases loaded ahead of time |
+| `agent-mcp.tools.browser.enabled` | `true` | Set to `false` to leave `quarkus_browser` out of the tool list, e.g. in headless or remote setups |
 | `agent-mcp.local-skills-dir` | `~/.quarkus/skills` | Directory for user-level skill customizations |
 | `agent-mcp.process.mvn-cmd` | _(auto-detect)_ | Override the Maven command used to start dev mode (e.g. `mvn` to skip wrapper detection) |
 | `agent-mcp.process.gradle-cmd` | _(auto-detect)_ | Override the Gradle command used to start dev mode (e.g. `gradle` to skip wrapper detection) |
