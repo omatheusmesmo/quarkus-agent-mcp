@@ -121,7 +121,8 @@ public class RagSqlLoader {
             "metadata\\s*->>\\s*'source'\\s*=\\s*'([^']+)'");
     /**
      * A row's source: {@code source} must be the metadata object's first key, as the generator
-     * emits it and as {@link #EXTENSION_FROM_SOURCE_PATTERN} already assumes. Matching a bare
+     * emits it, as {@link #EXTENSION_FROM_SOURCE_PATTERN} already assumes, and as
+     * {@link #appendSourceAndExtension} keeps it when rewriting a row. Matching a bare
      * {@code "source": "..."} anywhere would also hit JSON quoted inside a guide's own text -
      * the core docs artifact contains a platform-descriptor example that does exactly that -
      * and every source matched here is one a reload deletes rows for first, so a phantom that
@@ -696,8 +697,10 @@ public class RagSqlLoader {
     }
 
     /**
-     * Sets each row's {@code source}, and the {@code extension} key placed before it, to
+     * Sets each row's {@code source}, and the {@code extension} key placed after it, to
      * {@code extensionName}, except for rows that {@linkplain #declaresOwnSource declare their own}.
+     * {@code source} has to stay the metadata object's first key so that {@link #ROW_SOURCE_PATTERN}
+     * still finds it: a row keeping its own source is only deleted on reload if the pattern sees it.
      */
     private static String fixRowSources(String sql, String groupId, String extensionName) {
         Matcher matcher = EXTENSION_FROM_SOURCE_PATTERN.matcher(sql);
@@ -706,13 +709,24 @@ public class RagSqlLoader {
         while (matcher.find()) {
             String rowSource = matcher.group(1);
             String source = declaresOwnSource(sql, matcher.end(), groupId, rowSource) ? rowSource : extensionName;
-            result.append(sql, lastEnd, matcher.start())
-                    .append("'{\"extension\":\"").append(source)
-                    .append("\",\"source\":\"").append(source).append('"');
+            result.append(sql, lastEnd, matcher.start());
+            appendSourceAndExtension(result, source);
             lastEnd = matcher.end();
         }
         result.append(sql, lastEnd, sql.length());
         return result.toString();
+    }
+
+    /**
+     * Opens a row's metadata object with {@code source} followed by the {@code extension} key the
+     * search filter matches on. {@code source} comes first because {@link #ROW_SOURCE_PATTERN} is
+     * anchored on the opening brace, and the sources it finds are the ones a reload deletes before
+     * re-running the fragment's INSERTs - a row whose source is not found keeps its old copy, and
+     * the INSERT then collides on the baked-in {@code embedding_id} primary key.
+     */
+    private static void appendSourceAndExtension(StringBuilder result, String source) {
+        result.append("'{\"source\":\"").append(source)
+                .append("\",\"extension\":\"").append(source).append('"');
     }
 
     /**
@@ -769,8 +783,7 @@ public class RagSqlLoader {
         int lastEnd = 0;
         while (matcher.find()) {
             appendWithVersionKeyFix(result, sql, lastEnd, matcher.start());
-            String source = matcher.group(1);
-            result.append("'{\"extension\":\"").append(source).append("\",\"source\":\"").append(source).append('"');
+            appendSourceAndExtension(result, matcher.group(1));
             lastEnd = matcher.end();
         }
         appendWithVersionKeyFix(result, sql, lastEnd, sql.length());
@@ -1020,8 +1033,7 @@ public class RagSqlLoader {
             matcher.reset();
             while (matcher.find()) {
                 sb.append(statement, lastEnd, matcher.start());
-                String source = matcher.group(1);
-                sb.append("'{\"extension\":\"").append(source).append("\",\"source\":\"").append(source).append('"');
+                appendSourceAndExtension(sb, matcher.group(1));
                 lastEnd = matcher.end();
             }
             sb.append(statement, lastEnd, statement.length());

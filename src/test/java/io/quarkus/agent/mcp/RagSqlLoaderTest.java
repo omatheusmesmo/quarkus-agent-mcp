@@ -268,8 +268,8 @@ class RagSqlLoaderTest {
 
         assertTrue(result.sql().contains("\"extension\":\"quarkus-vault\""),
                 "Extension field should be injected");
-        assertTrue(result.sql().contains("\"extension\":\"quarkus-vault\",\"source\":\"quarkus-vault\""),
-                "Extension should appear before source");
+        assertTrue(result.sql().contains("{\"source\":\"quarkus-vault\",\"extension\":\"quarkus-vault\""),
+                "Source must stay the metadata object's first key, with extension right after it");
     }
 
     @Test
@@ -355,11 +355,28 @@ class RagSqlLoaderTest {
                 "quarkus-langchain4j-core", "3.33.0", CORE_GUIDE_URL);
 
         assertTrue(result.sql().contains(
-                "\"extension\":\"quarkus-langchain4j-anthropic\",\"source\":\"quarkus-langchain4j-anthropic\""),
+                "{\"source\":\"quarkus-langchain4j-anthropic\",\"extension\":\"quarkus-langchain4j-anthropic\""),
                 "Each guide should keep the source from its :extensions: header");
         assertTrue(result.sql().contains(
-                "\"extension\":\"quarkus-langchain4j-openai\",\"source\":\"quarkus-langchain4j-openai\""),
+                "{\"source\":\"quarkus-langchain4j-openai\",\"extension\":\"quarkus-langchain4j-openai\""),
                 "Each guide should keep the source from its :extensions: header");
+    }
+
+    /**
+     * The sources a reload deletes before re-running a fragment's INSERTs. A preserved source the
+     * scan cannot see leaves its rows in place, and the INSERTs then collide on the baked-in
+     * {@code embedding_id} primary key, rolling back the whole load.
+     */
+    @Test
+    void preservedRowSourcesAreVisibleToTheReloadScan() {
+        var fragment = new RagSqlLoader.RagFragment("quarkus-documentation", DIRECTORY_MODE_SQL);
+        var result = RagSqlLoader.injectExtensionMetadata(fragment, "io.quarkiverse.langchain4j",
+                "quarkus-langchain4j-core", "3.33.0", CORE_GUIDE_URL);
+
+        assertEquals(
+                Set.of("quarkus-langchain4j-anthropic", "quarkus-langchain4j-openai", "quarkus-langchain4j-core"),
+                RagSqlLoader.extractSources(result.sql(), result.source()),
+                "A reload must delete every source the fragment writes rows for, not just its own");
     }
 
     @Test
